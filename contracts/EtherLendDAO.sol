@@ -1,107 +1,129 @@
-----------------------------------------------------------
-    ----------------------------------------------------------
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+/**
+ * @title EtherLend DAO
+ * @notice A decentralized ETH lending protocol with DAO governance
+ * @dev Users can supply ETH, borrow ETH based on collateral (60% LTV),
+ *      and participate in governance voting using ELEND governance tokens.
+ */
+
+contract EtherLendDAO {
+    // Governance Token
+    string public constant name = "EtherLend Governance Token";
+    string public constant symbol = "ELEND";
+    uint8 public constant decimals = 18;
+
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+
+    // Lending Data
+    struct Account {
+        uint256 depositBalance;
+        uint256 borrowedBalance;
+    }
+
+    mapping(address => Account) public accounts;
+    uint256 public constant collateralRatio = 60; // 60% LTV
+
+    // DAO Proposal
     struct Proposal {
-        uint256 id;
-        address proposer;
         string description;
-        uint256 voteYes;
-        uint256 voteNo;
-        uint256 endBlock;
+        uint256 votes;
+        uint256 deadline;
         bool executed;
-        address target;
-        uint256 value;
-        bytes callData;
+        mapping(address => bool) voted;
     }
 
-    STATE VARIABLES
-    ~3 days on Ethereum
-    uint256 public proposalCount;
     mapping(uint256 => Proposal) public proposals;
-    mapping(uint256 => mapping(address => bool)) public voted;
+    uint256 public proposalCount;
 
-    address public treasury;
-    address public owner;
+    // Events
+    event Deposited(address indexed user, uint256 amount);
+    event Borrowed(address indexed user, uint256 amount);
+    event Repaid(address indexed user, uint256 amount);
+    event ProposalCreated(uint256 id, string description, uint256 deadline);
+    event Voted(uint256 id, address indexed voter, uint256 votes);
+    event ProposalExecuted(uint256 id);
 
-    EVENTS
-    ----------------------------------------------------------
-    ----------------------------------------------------------
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
+    // ──────────────────────────────────────────────
+    // Deposit & Borrow System
+    // ──────────────────────────────────────────────
+    function deposit() external payable {
+        require(msg.value > 0, "Deposit value required");
+
+        accounts[msg.sender].depositBalance += msg.value;
+
+        // Mint governance tokens equal to deposit
+        totalSupply += msg.value;
+        balanceOf[msg.sender] += msg.value;
+
+        emit Deposited(msg.sender, msg.value);
     }
 
-    CONSTRUCTOR
-    Create governance token and give DAO minting rights
-        token = new EtherLendToken(address(this));
+    function maxBorrowable(address user) public view returns (uint256) {
+        return (accounts[user].depositBalance * collateralRatio) / 100;
+    }
 
-        ----------------------------------------------------------
-    ----------------------------------------------------------
-    function createProposal(
-        string calldata description,
-        address target,
-        uint256 value,
-        bytes calldata callData
-    ) external returns (uint256) {
-        require(token.balanceOf(msg.sender) > 0, "No voting power");
+    function borrow(uint256 amount) external {
+        require(amount > 0, "Invalid borrow amount");
+        require(maxBorrowable(msg.sender) >= accounts[msg.sender].borrowedBalance + amount, "Collateral insufficient");
+
+        accounts[msg.sender].borrowedBalance += amount;
+        payable(msg.sender).transfer(amount);
+
+        emit Borrowed(msg.sender, amount);
+    }
+
+    function repay() external payable {
+        require(msg.value > 0, "No repayment amount");
+        require(accounts[msg.sender].borrowedBalance > 0, "Nothing to repay");
+
+        accounts[msg.sender].borrowedBalance -= msg.value;
+        emit Repaid(msg.sender, msg.value);
+    }
+
+    // ──────────────────────────────────────────────
+    // DAO Governance
+    // ──────────────────────────────────────────────
+    function createProposal(string calldata description, uint256 votingDuration) external {
+        require(balanceOf[msg.sender] > 0, "Governance token required to propose");
 
         proposalCount++;
+        Proposal storage p = proposals[proposalCount];
+        p.description = description;
+        p.deadline = block.timestamp + votingDuration;
 
-        proposals[proposalCount] = Proposal({
-            id: proposalCount,
-            proposer: msg.sender,
-            description: description,
-            voteYes: 0,
-            voteNo: 0,
-            endBlock: block.number + VOTING_DURATION,
-            executed: false,
-            target: target,
-            value: value,
-            callData: callData
-        });
-
-        emit ProposalCreated(proposalCount, msg.sender, description, target, value);
-        return proposalCount;
+        emit ProposalCreated(proposalCount, description, p.deadline);
     }
 
-    function vote(uint256 id, bool support) external {
-        Proposal storage p = proposals[id];
-        require(block.number < p.endBlock, "Voting ended");
-        require(!voted[id][msg.sender], "Already voted");
+    function vote(uint256 proposalId) external {
+        Proposal storage p = proposals[proposalId];
 
-        uint256 weight = token.balanceOf(msg.sender);
-        require(weight > 0, "No voting power");
+        require(block.timestamp < p.deadline, "Voting ended");
+        require(!p.voted[msg.sender], "Already voted");
+        require(balanceOf[msg.sender] > 0, "No governance tokens");
 
-        voted[id][msg.sender] = true;
+        p.voted[msg.sender] = true;
+        p.votes += balanceOf[msg.sender];
 
-        if (support) p.voteYes += weight;
-        else p.voteNo += weight;
-
-        emit Vote(id, msg.sender, support, weight);
+        emit Voted(proposalId, msg.sender, balanceOf[msg.sender]);
     }
 
-    function execute(uint256 id) external {
-        Proposal storage p = proposals[id];
-        require(block.number >= p.endBlock, "Voting still active");
+    function executeProposal(uint256 proposalId) external {
+        Proposal storage p = proposals[proposalId];
+
+        require(block.timestamp >= p.deadline, "Voting not finished");
         require(!p.executed, "Already executed");
-        require(p.voteYes > p.voteNo, "Proposal rejected");
 
         p.executed = true;
-
-        (bool success, ) = p.target.call{value: p.value}(p.callData);
-        require(success, "Execution failed");
-
-        emit Executed(id);
+        emit ProposalExecuted(proposalId);
     }
 
-    TREASURY FUNCTIONS
-    // ----------------------------------------------------------
-    receive() external payable {}
-
-    function withdrawTreasury(address to, uint256 amount) external onlyOwner {
-        require(address(this).balance >= amount, "Not enough ETH");
-        payable(to).transfer(amount);
+    // ──────────────────────────────────────────────
+    // View Functions
+    // ──────────────────────────────────────────────
+    function liquidityPool() external view returns (uint256) {
+        return address(this).balance;
     }
 }
-// 
-Contract End
-// 
